@@ -1,101 +1,175 @@
 #include "config.h"
 
-int message_count = 0;
+//#################################################################################################
+//### REMEMBER TO COMMENT OUT: Serial.begin(115200); FROM SETUP FUNCTION, AS IT AFFECTS RX PIN. ###
+//#################################################################################################
 
-// MQTT-Client erstellen
-WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
+// WLAN-Settings
+  const char* ssid = "ISDProjectLAN";
+  const char* password = "557949122";
 
-// MQTT-Nachrichten verarbeiten
-void callback(char* topic, byte* payload, unsigned int length) {
-  // Nachricht ausgeben
-  Serial.print("Nachricht empfangen: ");
-  Serial.print(topic);
-  Serial.print(" : ");
-  for (int i = 0; i < length; i++) {
-    Serial.print((char)payload[i]);
+//Mqtt topics to publish
+  const String pubInit = "/registration/Server/"+ String(WiFi.macAddress());
+  const char* pubPubVote = "/vote/";
+
+// MQTT topics to subscribe
+  const String subInit = "/registration/esp/"+ String(WiFi.macAddress()); // /registration/esp/
+  const char* subVoteSetup = "/setupVote/Setup";
+  const char* subResync = "/setupVote/Resync";
+
+//battery level
+  int batteryPercentage = checkBatteryLevel();
+
+//program variables
+  int state = 0;
+  char response[STRINGSIZE] = "";
+  char votingID[STRINGSIZE] = "";
+  char pubTopicVoteResponse[STRINGSIZE] = "";
+  char voteTitle[STRINGSIZE] = "";
+  char responseBuffer[STRINGSIZE+50];
+
+void connectToWiFi() {
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
   }
   Serial.println();
-  // Nachricht weiterleiten
-  //mqttClient.publish("e", payload, length);
+  Serial.print("Connected, IP address: ");
+  Serial.println(WiFi.localIP());
 }
 
 void setup() {
+  //Serial.begin(115200);
+
+//button initialization
   pinMode(BUTTON_PIN_1, INPUT_PULLUP);  // Taster 1 als Eingang mit Pull-up-Widerstand
   pinMode(BUTTON_PIN_2, INPUT_PULLUP);  // Taster 2 als Eingang mit Pull-up-Widerstand
-  pinMode(BUTTON_PIN_3, INPUT_PULLUP);  // Taster 3 als Eingang mit Pull-up-Widerstand
+  pinMode(PWR_PIN, OUTPUT);
+  pinMode(RX_PIN, INPUT_PULLUP);
+  digitalWrite(PWR_PIN, HIGH); //power on device
+  
+//Display initialization
+  initDisplay();
+  startupScreen(batteryPercentage);
 
-#ifdef STATUS_LEDS
-  pinMode(LED_PIN_1, OUTPUT);  // LED 1 als Ausgang
-  pinMode(LED_PIN_2, OUTPUT);  // LED 2 als Ausgang
-  pinMode(LED_PIN_3, OUTPUT);  // LED 3 als Ausgang
-#endif
-
-#ifdef DEBUG
-  Serial.begin(115200);
-#endif
-  delay(10);
-
-// Verbindung zum WLAN herstellen
-#ifdef DEBUG
-  Serial.println("Verbindung zum WLAN herstellen");
-#endif
+//wifi initialization
   WiFi.begin(ssid, password);
+  connectToWiFi();
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-#ifdef DEBUG
-    Serial.print(".");
-#endif
-  }
-#ifdef DEBUG
-  Serial.println("Verbindung zum WLAN hergestellt");
-#endif
-
-  // Verbindung zum MQTT-Server herstellen
+//mqtt initialization
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(callback);
-  mqttClient.subscribe("#");
-
-  while (!mqttClient.connected()) {
-#ifdef DEBUG
-    Serial.println("Verbindung zum MQTT-Server herstellen");
-#endif
-    mqttClient.connect("ESP8266", mqtt_user, mqtt_password);
-    delay(500);
-  }
-#ifdef DEBUG
-  Serial.println("Verbindung zum MQTT-Server hergestellt");
-#endif
+  connectToMQTT();
+  String macAddress = "{\"Mac\" : \"" + String(WiFi.macAddress()) + "\"}";
+  Serial.println(macAddress);
+  mqttClient.subscribe(subInit.c_str(), MQTTsubQos); //recieve voting ID
+  mqttClient.publish(pubInit.c_str(), macAddress.c_str());  //send mac address
+  Serial.println("#" + String(subInit.c_str()) + "#") ;
+  //mqttClient.subscribe(subResync, MQTTsubQos);
+  mqttClient.subscribe(subVoteSetup, MQTTsubQos); //recieve question
 }
-
+  
 void loop() {
-  if (digitalRead(BUTTON_PIN_1) == LOW) {
-    digitalWrite(LED_PIN_1, HIGH);  // Wenn Taster 1 gedrückt wird, schalte LED 1 ein
-    if (message_count == 0) {
-      mqttClient.publish("send", "Taster 1!");
-      message_count++;
-    }
-  } else {
-    message_count = 0;
-    digitalWrite(LED_PIN_1, LOW);  // Andernfalls schalte LED 1 aus
+  powerOff();
+  switch (state) {
+    case BOOT:
+  //display start up screen
+      if (MQTT_flag) {
+        MQTT_flag = 0;
+        strcpy(votingID, MQTTVotingId);
+        Serial.println(votingID);
+        state = QUESTION; 
+      }
+      break;
+
+    case QUESTION:
+      if (MQTT_flag) {
+        MQTT_flag = 0;
+        strcpy(voteTitle, MQTTVotingTitle);
+        Serial.println(voteTitle);
+        paintVoteScreen(voteTitle);
+        strcat(pubTopicVoteResponse, pubPubVote);
+        strcat(pubTopicVoteResponse, votingID);
+        Serial.println(pubTopicVoteResponse);
+        state = VOTE;
+      }
+      break;
+
+    case VOTE:
+      if (!digitalRead(BUTTON_PIN_1)) {
+        delay(30);
+        if (!digitalRead(BUTTON_PIN_1)){
+          Serial.println("I am in Button1: Vote");
+          snprintf(responseBuffer, sizeof(responseBuffer), "{\"vote\":\"Yes\", \"VoteTitle\":\"%s\"}", MQTTVotingTitle);
+          strcpy(response, responseBuffer);
+          paintConfirmScreen("YES");
+          Serial.println("YES");
+          state = CONFIRM;
+          while (!digitalRead(BUTTON_PIN_1)){
+            delay(100);
+          }
+        }      
+      }
+      else if (!digitalRead(BUTTON_PIN_2)) {
+        delay(30);
+        if (!digitalRead(BUTTON_PIN_2)){
+          snprintf(responseBuffer, sizeof(responseBuffer), "{\"vote\":\"Abstain\", \"VoteTitle\":\"%s\"}", MQTTVotingTitle);
+          strcpy(response, responseBuffer);
+          paintConfirmScreen("ABSTAIN");
+          Serial.println("ABSTAIN");
+          state = CONFIRM;
+          while (!digitalRead(BUTTON_PIN_2)){
+            delay(100);
+          }
+        }
+      }
+      else if (!digitalRead(BUTTON_PIN_3)) {
+        delay(30);
+        if (!digitalRead(BUTTON_PIN_3)){
+          snprintf(responseBuffer, sizeof(responseBuffer), "{\"vote\":\"No\", \"VoteTitle\":\"%s\"}", MQTTVotingTitle);
+          strcpy(response, responseBuffer);
+          paintConfirmScreen("NO");
+          Serial.println("NO");
+          state = CONFIRM;
+          while (!digitalRead(BUTTON_PIN_3)){
+            delay(100);
+          }
+        }
+      }
+      break;
+
+    case CONFIRM:
+    // ButtonYes.getState()
+      if (!digitalRead(BUTTON_PIN_1)) {
+        delay(30);
+        if (!digitalRead(BUTTON_PIN_1)){
+          Serial.println("I am in Button1: Confirm");
+          mqttClient.publish(pubTopicVoteResponse, response);
+          state = CLOSE_VOTE;
+          while (!digitalRead(BUTTON_PIN_1)){
+            delay(100);
+          }
+        }
+      }
+      else if (!digitalRead(BUTTON_PIN_3)) {
+        delay(30);
+        if (!digitalRead(BUTTON_PIN_3)){
+          paintVoteScreen(voteTitle);
+          state = VOTE;
+          while (!digitalRead(BUTTON_PIN_3)){
+            delay(100);
+          }
+        }
+      }
+      break;
+
+    case CLOSE_VOTE:
+      delay(2000);
+      paintClosingScreen();
+      state = QUESTION;
+      break;
   }
 
-  if (digitalRead(BUTTON_PIN_2) == LOW) {
-    digitalWrite(LED_PIN_2, HIGH);  // Wenn Taster 2 gedrückt wird, schalte LED 2 ein
-  } else {
-    digitalWrite(LED_PIN_2, LOW);  // Andernfalls schalte LED 2 aus
-  }
-
-  if (digitalRead(BUTTON_PIN_3) == LOW) {
-    digitalWrite(LED_PIN_3, HIGH);  // Wenn Taster 3 gedrückt wird, schalte LED 3 ein
-  } else {
-    digitalWrite(LED_PIN_3, LOW);  // Andernfalls schalte LED 3 aus
-  }
-  // MQTT-Nachrichten abrufen
-  if (!mqttClient.loop()) {
-#ifdef DEBUG
-    Serial.println("Verbindung zum MQTT-Server abgebrochen");
-#endif
-  }
+ mqttClient.loop();
 }
